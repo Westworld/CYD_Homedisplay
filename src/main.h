@@ -13,3 +13,7 @@ void internet_needle(void);
 void WifiConnect();
 void MQTT_callback(char* topic, byte* payload, unsigned int length);
 void Fritz_Data();
+
+
+
+

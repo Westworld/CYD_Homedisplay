@@ -9,6 +9,10 @@ SPIClass touchscreenSpi = SPIClass(VSPI);
 XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
 uint16_t touchScreenMinimumX = 200, touchScreenMaximumX = 3700, touchScreenMinimumY = 240,touchScreenMaximumY = 3800;
 
+#define CYD_LED_BLUE 17
+#define CYD_LED_RED 4
+#define CYD_LED_GREEN 16
+
 /*Set to your screen resolution*/
 #define TFT_HOR_RES   320
 #define TFT_VER_RES   240
@@ -17,6 +21,7 @@ uint16_t touchScreenMinimumX = 200, touchScreenMaximumX = 3700, touchScreenMinim
 #define DRAW_BUF_SIZE (TFT_HOR_RES * TFT_VER_RES / 10 * (LV_COLOR_DEPTH / 8))
 
 WiFiClient wifiClient;
+WiFiClient wifiClient_mqtt;
 const char* wifihostname = "CYD_Homedisplay";
 #define NTP_SERVER "de.pool.ntp.org"
 #define DefaultTimeZone "CET-1CEST,M3.5.0/02,M10.5.0/03"  
@@ -25,7 +30,7 @@ String MY_TZ = DefaultTimeZone ;
 const char* mqtt_server = "192.168.0.46";
 int8_t mqtterrorcounter=0;
 // MQTT_User and MQTT_Pass defined via platform.ini, external file, not uploaded to github
-PubSubClient mqttclient(wifiClient);
+PubSubClient mqttclient(wifiClient_mqtt);
 
 
 /* LVGL calls it when a rendered image needs to copied to the display*/
@@ -34,6 +39,7 @@ void my_disp_flush( lv_display_t *disp, const lv_area_t *area, uint8_t * px_map)
     /*Call it to tell LVGL you are ready*/
     lv_disp_flush_ready(disp);
 }
+
 /*Read the touchpad*/
 void my_touchpad_read( lv_indev_t * indev, lv_indev_data_t * data )
 {
@@ -49,12 +55,12 @@ void my_touchpad_read( lv_indev_t * indev, lv_indev_data_t * data )
     data->point.x = map(p.x,touchScreenMinimumX,touchScreenMaximumX,1,TFT_HOR_RES); /* Touchscreen X calibration */
     data->point.y = map(p.y,touchScreenMinimumY,touchScreenMaximumY,1,TFT_VER_RES); /* Touchscreen Y calibration */
     data->state = LV_INDEV_STATE_PRESSED;
-    /*
+    
     Serial.print("Touch x ");
     Serial.print(data->point.x);
     Serial.print(" y ");
     Serial.println(data->point.y);
-    */
+    
   }
   else
   {
@@ -75,6 +81,13 @@ lv_obj_t * upload_scale_line = NULL;
 lv_obj_t * download_needle = NULL;
 lv_obj_t * download_scale_line = NULL;
 long millicounter = 0;
+short http_error_counter = 0;
+LV_IMAGE_DECLARE(img_hand);
+
+static uint32_t my_tick_get_cb(void) {
+  //esp_timer_get_time() / 1000;
+  return millis();
+}
 
 void internet_init() {
   top_label = lv_label_create(lv_screen_active());
@@ -123,12 +136,20 @@ void internet_needle(void)
     lv_scale_set_angle_range(download_scale_line, 270);
     lv_scale_set_rotation(download_scale_line, 135);
 
-    download_needle = lv_line_create(download_scale_line);
+    /* image must point to the right. E.g. -O------>*/
+    download_needle = lv_image_create(download_scale_line);
+    lv_image_set_src(download_needle, &img_hand);
+    lv_obj_align(download_needle, LV_ALIGN_CENTER, 47, -2);
+    lv_image_set_pivot(download_needle, 3, 4);
 
-    lv_obj_set_style_line_width(download_needle, 6, LV_PART_MAIN);
-    lv_obj_set_style_line_rounded(download_needle, true, LV_PART_MAIN);
+lv_scale_set_image_needle_value(download_scale_line, download_needle, 30);
 
-    lv_scale_set_line_needle_value(download_scale_line, download_needle, 60, 0);
+    //download_needle = lv_line_create(download_scale_line);
+    //lv_obj_set_style_line_width(download_needle, 6, LV_PART_MAIN);
+    //lv_obj_set_style_line_rounded(download_needle, true, LV_PART_MAIN);
+    //lv_scale_set_line_needle_value(download_scale_line, download_needle, 60, 0);
+
+
 
     // upload
     upload_scale_line = lv_scale_create(lv_screen_active());
@@ -158,11 +179,11 @@ void internet_needle(void)
     lv_obj_set_style_line_width(upload_needle, 6, LV_PART_MAIN);
     lv_obj_set_style_line_rounded(upload_needle, true, LV_PART_MAIN);
 
-    lv_scale_set_line_needle_value(upload_scale_line, upload_needle, 60, 0);
+    lv_scale_set_line_needle_value(upload_scale_line, upload_needle, 60, 50);
 }
 
-
 void WifiConnect() {
+    WiFi.disconnect();
     WiFi.setHostname(wifihostname);  
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -179,18 +200,42 @@ void WifiConnect() {
     Serial.println(ip);
 }
 
-  // Callback function
+void mqttclient_connect() {
+   Serial.printf("vor MQTT");
+    mqttclient.setServer(mqtt_server, 1883);
+    mqttclient.setCallback(MQTT_callback);
+    mqttclient.setBufferSize(1024);
+    mqttclient.setKeepAlive(60);
+   if (mqttclient.connect(wifihostname, MQTT_User, MQTT_Pass)) {
+      Serial.printf("MQTT connect successful"); 
+      const char *TOPIC2 = "HomeServer/Internet/#";
+      mqttclient.subscribe(TOPIC2);
+      //mqttclient.subscribe("Haus/+/Power");
+   }  
+    else
+       Serial.printf("MQTT connect error");  
+
+   Serial.printf("nach MQTT2");
+   Serial.flush();
+
+}
+
 void MQTT_callback(char* topic, byte* payload, unsigned int length) {
 
     String message = String(topic);
-    int8_t joblength = message.length()+1;// 0 char
+    //int8_t joblength = message.length()+1;// 0 char
     payload[length] = '\0';
     String value = String((char *) payload);
 
+//Serial.println(message);
+
     if (message == "HomeServer/Internet/Download")  
-    {  lv_label_set_text_fmt(download_label,  "Download: %s", payload); return; }
+    {  lv_label_set_text_fmt(download_label,  "Download: %s", payload); 
+    Serial.println((char *)payload);
+        return; }
     if (message == "HomeServer/Internet/Upload")  
-    {  lv_label_set_text_fmt(upload_label,  "Upload: %s", payload); return; }
+    {  lv_label_set_text_fmt(upload_label,  "Upload: %s", payload);
+     return; }
 
 /*
     if (message == "HomeServer/Internet/DownloadRate")  
@@ -212,6 +257,13 @@ void setup() {
   Serial.begin(115200);
   WifiConnect() ;
 
+  pinMode(CYD_LED_RED, OUTPUT);  // all off
+  pinMode(CYD_LED_GREEN, OUTPUT);
+  pinMode(CYD_LED_BLUE, OUTPUT);
+  digitalWrite(CYD_LED_RED, HIGH); 
+  digitalWrite(CYD_LED_GREEN, HIGH);
+  digitalWrite(CYD_LED_BLUE, HIGH);
+
   //Initialise the touchscreen
   touchscreenSpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS); /* Start second SPI bus for touchscreen */
   touchscreen.begin(touchscreenSpi); /* Touchscreen init */
@@ -219,6 +271,8 @@ void setup() {
 
   //Initialise LVGL
   lv_init();
+  lv_tick_set_cb(my_tick_get_cb);
+
   draw_buf = new uint8_t[DRAW_BUF_SIZE];
   lv_display_t * disp;
   disp = lv_tft_espi_create(TFT_HOR_RES, TFT_VER_RES, draw_buf, DRAW_BUF_SIZE);
@@ -228,64 +282,38 @@ void setup() {
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);  
   lv_indev_set_read_cb(indev, my_touchpad_read);
 
+  lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+
+
   internet_init();
   internet_needle();
 
-   Serial.printf("vor MQTT");
-    mqttclient.setServer(mqtt_server, 1883);
-    mqttclient.setCallback(MQTT_callback);
-    mqttclient.setBufferSize(1024);
-   if (mqttclient.connect(wifihostname, MQTT_User, MQTT_Pass)) {
-      //mqttclient.publish("outTopic","hello world");
-      Serial.printf("MQTT connect successful"); 
-      //const char *TOPIC = "Haus/Sonoff POW R1/R2/Dreamer_Power/#";
-      const char *TOPIC2 = "HomeServer/#";
-      mqttclient.subscribe(TOPIC2);
-      //mqttclient.subscribe("Haus/+/Power");
-   }  
-    else
-       Serial.printf("MQTT connect error");  
-
-   Serial.printf("nach MQTT2");
-    Serial.flush();
-
-   Fritz_Data();
+   mqttclient_connect();
 }
 
 void loop() {
-
-     //Serial.println("loop"); Serial.flush(); 
-
     if (WiFi.status() != WL_CONNECTED)
       WifiConnect();
 
-  if (!mqttclient.loop()) {
-    if (mqttclient.connect(wifihostname, MQTT_User, MQTT_Pass)) {
-      mqtterrorcounter=0;
-   }  
-    else 
-       if (mqtterrorcounter++ > 5)
-        ESP.restart();
-  };      
+  if (!mqttclient.connected()) {
+    mqttclient_connect();
+  } 
+  mqttclient.loop();       
 
   long curmillis = millis();
   if (millicounter < curmillis)
   {  Fritz_Data();
-     curmillis = millis();
-     millicounter = curmillis+7500;
+     //curmillis = millis();
+     millicounter = curmillis+5000;
   }
-
-    lv_tick_inc(curmillis - lastTick); //Update the tick timer. Tick is new for LVGL 9
-    lastTick = curmillis;
     lv_timer_handler();               //Update the UI
-    delay(5);
-    
+    delay(5);   
 }
 
 void Fritz_Data() {
-  //Serial.println("Start fritz:"); Serial.flush();
       HTTPClient http;
-      http.begin("http://fritz.box:49000/igdupnp/control/WANCommonIFC1");
+      http.setReuse(false);
+      http.begin(wifiClient, "http://fritz.box:49000/igdupnp/control/WANCommonIFC1");
       http.addHeader("Content-Type", "text/xml");
       http.addHeader("SOAPACTION", "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1#GetAddonInfos");
       String httpRequestData = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"";
@@ -293,8 +321,7 @@ void Fritz_Data() {
       httpRequestData += "<s:Body><u:GetAddonInfos xmlns:u=\"urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1\">";
       httpRequestData += "</u:GetAddonInfos></s:Body></s:Envelope>";
 
-      int httpResponseCode = http.POST(httpRequestData);
-      
+      int httpResponseCode = http.POST(httpRequestData);     
       if (httpResponseCode>0) {
         //Serial.print("HTTP Response code: ");
         //Serial.println(httpResponseCode);
@@ -311,6 +338,7 @@ void Fritz_Data() {
         //Serial.println(sub);
         float value = sub.toFloat() * 8 / 1024;  
         long lvalue = value / 1000;
+        // Serial.println(lvalue);
         lv_scale_set_line_needle_value(upload_scale_line, upload_needle, 60, lvalue);
 
         // find <NewByteSendRate>11214</NewByteSendRate>
@@ -323,15 +351,21 @@ void Fritz_Data() {
         pos1 = sub.indexOf("<");
         sub = sub.substring(0, pos1);
         //Serial.print("zahl: ");
-        //Serial.println(sub);
+
         value = sub.toFloat() * 8 / 1024;  
         lvalue = value / 1000;
-        lv_scale_set_line_needle_value(download_scale_line, download_needle, 60, lvalue);
 
+         lv_scale_set_image_needle_value(download_scale_line, download_needle, lvalue);
+//Serial.print("vor Label set");  Serial.flush();       
+//lv_label_set_text_fmt(download_label,  "D: %lu", lvalue);
+
+        http_error_counter = 0;
       }
       else {
         Serial.print("Error code: ");
         Serial.println(httpResponseCode);
+        if (http_error_counter++ > 1)
+          WifiConnect();
       }
       // Free resources
       http.end();
